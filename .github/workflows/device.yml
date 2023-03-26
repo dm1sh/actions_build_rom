@@ -14,11 +14,11 @@ on:
        manifest:
          description: 'Manifest'
          required: true
-         default: 'https://github.com/lineageos/android.git'
+         default: 'https://github.com/LineageOS/android.git'
        branch:
          description: 'Branch(Manifest)'
          required: true
-         default: 'lineage-20'
+         default: 'lineage-20.0'
        target:
          description: 'Target(Consistent with grus.json file name)'
          required: true
