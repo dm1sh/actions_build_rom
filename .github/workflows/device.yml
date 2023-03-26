@@ -1,0 +1,218 @@
+name: build(device)
+
+on:
+  #push:
+  #pull_request:
+  schedule:
+    - cron:  '0 3 5 * *'
+  workflow_dispatch:
+     inputs:
+       rom:
+         description: 'ROM(Project folder)'
+         required: true
+         default: 'lineage'
+       manifest:
+         description: 'Manifest'
+         required: true
+         default: 'git://github.com/lineageos/android.git'
+       branch:
+         description: 'Branch(Manifest)'
+         required: true
+         default: 'lineage-20'
+       target:
+         description: 'Target(Consistent with grus.json file name)'
+         required: true
+         default: 'sunny'
+       lunch:
+         description: 'Lunch(aosp,lineage...)'
+         required: true
+         default: 'lineage'
+       brand:
+         description: 'Brand'
+         required: true
+         default: 'xiaomi'
+       sync:
+         description: 'Sync'
+         required: true
+         default: 'true'
+       clean:
+         description: 'Make Clean(clean,rm)'
+         required: true
+         default: 'clean'
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-20.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Install build packages
+        run: |
+            apt install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick \
+            lib32ncurses5-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool libncurses5 libncurses5-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync \
+            schedtool squashfs-tools xsltproc \
+            zip zlib1g-dev
+            if [ ! -e /usr/bin/python ]; then
+                ln -s /usr/bin/python /usr/bin/python3
+            fi
+            
+        
+      - name: Create Rom folder
+        run: |
+            echo "Check if the project folder exists, or create it if it does not."
+            apt install -y jq
+            shutdown -c
+            if [ ! -d ${{ github.event.inputs.rom }} ]; then
+                mkdir ${{ github.event.inputs.rom }}
+            fi
+            ls
+
+      - name: Make Clean
+        run: |
+            echo "Check if the product folder exists, skip if it doesn't"
+            if [ -d ${{ github.event.inputs.rom }}/out/target/product/ ]; then
+                cd ${{ github.event.inputs.rom }}
+                if [ -f log.txt ]; then
+                    rm -rf log.txt
+                fi
+                if [[ ${{ github.event.inputs.clean }} = "clean" ]]; then
+                    source build/envsetup.sh
+                    make clean
+                    echo "Make Clean"
+                elif [[ ${{ github.event.inputs.clean }} = "rm" ]]; then
+                    rm -rf out/target/product/${{ github.event.inputs.target }}
+                    echo "remove"
+                fi
+            fi
+
+      - id: sync
+        name: Repo Sync
+        if: github.event.inputs.sync == 'true'
+        run: |
+            echo "Go to the ${{ github.event.inputs.rom }} folder"
+            cd ${{ github.event.inputs.rom }}
+            if ! [ -f "$HOME/bin/repo" ]; then
+                mkdir -p $HOME/bin
+                curl https://storage.googleapis.com/git-repo-downloads/repo > $HOME/bin/repo
+                chmod a+x $HOME/bin/repo
+            fi
+            export PATH="$HOME/bin:$PATH"
+            if ! [ -f ".repo/manifest.xml" ]; then
+                echo "manifest.xml does not exist, re-initialize"
+                repo init -u ${{ github.event.inputs.manifest }} -b ${{ github.event.inputs.branch }} --git-lfs --depth=1
+            fi
+            ls
+            echo "Start synchronization"
+            SYNC_START=$(date +"%s")
+            if [ -f Makefile ]; then
+                rm -rf Makefile
+                rm -rf packages/apps/Settings
+                rm -rf packages/apps/Updates
+            fi
+            echo "Syncing ${{ github.event.inputs.rom }} Start Time: $(date +"%Y-%m-%d"-%H:%M)"
+            repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+            ls
+            SYNC_END=$(date +"%s")
+            DIFF=$(($SYNC_END - $SYNC_START))
+            echo "Sync ${{ steps.var.outputs.rom }} Finished Time: $(($DIFF / 60)) minutes and $(($DIFF % 60)) seconds"
+            echo "End of synchronization"
+
+      - id: dt
+        name: Cloning device specific dependencies
+        run: |
+            echo "Cloning device specific dependencies"
+            cd ${{ github.event.inputs.rom }}
+            ls
+            echo "Cloning device specific dependencies"
+            count=$(jq length ${{ github.event.inputs.target }}.json)
+            echo $count
+            if [ ! -d "device/${{ github.event.inputs. brand }}/${{ github.event.inputs.target }}" ]; then
+                echo "Clean up device trees"
+                rm -rf device/${{ github.event.inputs.brand }}
+                rm -rf kernel/${{ github.event.inputs.brand }}
+                rm -rf vendor/${{ github.event.inputs.brand }}
+            fi
+            for ((i=0;i<${count};i++));
+            do
+               repo_url=$(jq -r --argjson i $[i] '.[$i].url' ${{ github.event.inputs.target }}.json)
+               echo $repo_url
+               branch=$(jq -r --argjson i $[i] '.[$i].branch' ${{ github.event.inputs.target }}.json)
+               echo $branch
+               target=$(jq -r --argjson i $[i] '.[$i].target_path' ${{ github.event.inputs.target }}.json)
+               echo $target
+               rm -rf $target
+               if [ ! -d $target ]; then
+                   crlstatus=$(curl -s -m 5 -IL ${repo_url}|grep 200)
+                   echo $crlstatus
+                   if [[ -z "${crlstatus}" ]]; then
+                       echo "Using the Manifest branch"
+                       git clone -b ${{ github.event.inputs.branch }} ${repo_url} ${target} --depth=1
+                   else
+                       echo "Using the default branch"
+                       git clone -b ${branch} ${repo_url} ${target} --depth=1
+                   fi
+               fi
+            done
+            rm -rf ${{ github.event.inputs.target }}.json
+            
+      - id: build
+        name: Start Building
+        continue-on-error: true
+        timeout-minutes: 120
+        run: |
+            echo "Start building"
+            cd ${{ github.event.inputs.rom }}
+            echo "CCACHE is enabled for this build"
+            # check and set ccache path on envsetup
+            if [ -z ${CCACHE_EXEC} ]; then
+                ccache_path=$(which ccache)
+                if [ ! -z "$ccache_path" ]; then
+                    export CCACHE_EXEC="$ccache_path"
+                    echo "ccache found and CCACHE_EXEC has been set to : $ccache_path"
+                else
+                    echo "ccache not found/installed!"
+                fi
+                export USE_CCACHE=1
+                export CCACHE_DIR="$HOME/.ccache/${{ github.event.inputs.rom }}/${{ github.event.inputs.target }}"
+                ccache -M 50G
+                ccache -s
+            fi
+            echo "${{ github.event.inputs.rom }} start building"
+            BUILD_START=$(date +"%s")
+            source build/envsetup.sh
+            lunch ${{ github.event.inputs.lunch }}_${{ github.event.inputs.target }}-userdebug
+            make bacon -j$(nproc --all) 2>&1 | tee log.txt
+            BUILD_END=$(date +"%s")
+            DIFF=$(($BUILD_END - $BUILD_START))
+            FILENAME="$(ls -lS out/target/product/${{ github.event.inputs.target }}/*${{ github.event.inputs.rom }}*.zip | head -1 | awk '{print $9}')"
+            if [[ -z "${FILENAME}" ]]; then
+                FILENAME="$(ls -lS out/target/product/${{ github.event.inputs.target }}/*.zip | head -1 | awk '{print $9}')"
+            fi
+            SIZE="$(du -sh ${FILENAME} | awk '{print $1}')"
+            echo $SIZE
+            echo $FILENAME
+            NAME="$FILENAME"
+            echo "::set-output name=filename::${NAME}"
+            echo "::set-output name=name::$(basename ${FILENAME})"
+            echo "::set-output name=size::${SIZE}"
+            if [[ ! -z "${NAME}" ]]; then
+                echo "${{ github.event.inputs.rom }} Build Complete : $((DIFF / 3600)) hour(h) $((DIFF / 60 % 60)) minute(s) and $((DIFF % 60)) second(s)"
+            else
+                echo "${{ github.event.inputs.rom }} Build for ${{ github.event.inputs.target }} failed in $((DIFF / 3600)) hour(h) $((DIFF / 60 % 60)) minute(s) and $((DIFF % 60)) second(s)!"
+                exit 1
+            fi
+            echo "Compilation completed"
+            exit 0
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          files: ${{ github.event.inputs.rom }}/${{ steps.build.outputs.name }}
+          name: ${{ steps.build.outputs.name }}
+          tag_name: ${{ github.run_id }}
